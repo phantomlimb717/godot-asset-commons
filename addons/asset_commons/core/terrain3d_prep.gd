@@ -308,7 +308,17 @@ static func _build_lods(surfaces: Array, budgets: Array) -> Dictionary:
 		full_tris += (s.arrays[Mesh.ARRAY_INDEX] as PackedInt32Array).size() / 3
 		var isl := _islands(s.arrays)
 		if isl.count >= FOLIAGE_MIN_PIECES and isl.tris_per_piece <= FOLIAGE_MAX_PIECE_TRIS:
-			s.islands = isl
+			# Foliage surfaces often also hold twig stems (fir_tree_01: 1k stems of
+			# 30-140 tris among 90k four-tri needles). Stems are structure: thinning
+			# or enlarging them leaves floating needles and long diagonal sticks, so
+			# they go with the solid parts and only the small pieces get thinned.
+			var split := _split_pieces(s.arrays, isl, FOLIAGE_STEM_MIN_TRIS)
+			if not split.big.is_empty():
+				solid.append({"arrays": split.big, "material": s.material})
+			if split.small.is_empty():
+				continue
+			s.arrays = split.small
+			s.islands = _islands(s.arrays)
 			foliage.append(s)
 		else:
 			solid.append(s)
@@ -330,6 +340,7 @@ static func _build_lods(surfaces: Array, budgets: Array) -> Dictionary:
 		levels.append(tris)
 	var solid_full: int = levels[0] if not levels.is_empty() else 0
 
+	var foliage_full := full_tris - solid_full
 	var lods := []
 	var keeps := []
 	var last_tris := -1
@@ -337,9 +348,14 @@ static func _build_lods(surfaces: Array, budgets: Array) -> Dictionary:
 		var ratio := minf(1.0, float(budget) / maxi(full_tris, 1))
 		var mesh := ArrayMesh.new()
 		var tris := 0
-		# Solid part: level closest to its proportional share.
+		# Solid part: level closest to its share. With foliage present, trunk and
+		# branches claim the budget first (up to SOLID_MAX_SHARE of it): they are a
+		# small part of a tree, and simplifying them hard breaks branches into
+		# floating sticks. Without foliage (rocks), a proportional share.
 		if not solid.is_empty():
 			var target := maxf(solid_full * ratio, 1.0)
+			if not foliage.is_empty():
+				target = maxf(minf(solid_full, budget * SOLID_MAX_SHARE), 1.0)
 			var best := 0
 			var best_score := INF
 			for i in levels.size():
@@ -352,8 +368,9 @@ static func _build_lods(surfaces: Array, budgets: Array) -> Dictionary:
 				mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 				mesh.surface_set_material(mesh.get_surface_count() - 1, im.get_surface_material(i))
 			tris += levels[best]
-		# Foliage part: thin out pieces, enlarge survivors.
-		var keep := maxf(ratio, FOLIAGE_MIN_KEEP)
+		# Foliage part: thin out pieces to fill the rest of the budget, enlarge survivors.
+		var keep := minf(1.0, float(budget - tris) / maxi(foliage_full, 1))
+		keep = maxf(keep, FOLIAGE_MIN_KEEP)
 		for s in foliage:
 			var thinned := _thin_foliage(s.arrays, s.islands, keep)
 			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, thinned)
@@ -371,11 +388,38 @@ static func _build_lods(surfaces: Array, budgets: Array) -> Dictionary:
 
 ## A surface counts as foliage when it is many small disconnected pieces.
 const FOLIAGE_MIN_PIECES := 200
+## Most of a LOD's budget that trunk/branches/stems may take before foliage gets the rest.
+const SOLID_MAX_SHARE := 0.7
 const FOLIAGE_MAX_PIECE_TRIS := 64.0
+## Pieces of a foliage surface with at least this many triangles are stems
+## (structure), not leaves/needles.
+const FOLIAGE_STEM_MIN_TRIS := 16
 ## Never thin below this fraction of pieces (keeps the far LOD readable).
 const FOLIAGE_MIN_KEEP := 0.03
-## Survivors grow by 1/sqrt(keep) to preserve covered area, capped here.
-const FOLIAGE_MAX_SCALE := 2.5
+## Survivors grow by 1/sqrt(keep) to preserve covered area, capped here. Kept
+## low: big enlargement turns needles into sticks that float off their twigs.
+const FOLIAGE_MAX_SCALE := 1.4
+
+
+## Splits a surface's triangles by piece size: {big: arrays, small: arrays}
+## (either may be empty).
+static func _split_pieces(arrays: Array, islands: Dictionary, min_tris: int) -> Dictionary:
+	var tri_island: PackedInt32Array = islands.tri_island
+	var sizes := PackedInt32Array()
+	sizes.resize(islands.count)
+	for isl in tri_island:
+		sizes[isl] += 1
+	var idx: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+	var big := PackedInt32Array()
+	var small := PackedInt32Array()
+	# Packed arrays are values in GDScript, so append to each one by name.
+	for t in tri_island.size():
+		if sizes[tri_island[t]] >= min_tris:
+			big.append_array(idx.slice(t * 3, t * 3 + 3))
+		else:
+			small.append_array(idx.slice(t * 3, t * 3 + 3))
+	return {"big": _compact(arrays, big) if not big.is_empty() else [],
+		"small": _compact(arrays, small) if not small.is_empty() else []}
 
 
 ## Connected pieces of a surface. Vertices at the same position are welded
@@ -512,7 +556,9 @@ static func _compact(arrays: Array, indices: PackedInt32Array) -> Array:
 # --- Materials / lookup ----------------------------------------------------------
 
 ## Materials embedded in the imported glTF are saved once as .tres files so all
-## LOD meshes share them instead of each embedding a copy.
+## LOD meshes share them instead of each embedding a copy. A material file that
+## already exists is reused as-is, so hand-tuned materials (e.g. wind shaders)
+## survive re-running prep; delete the file to regenerate it.
 static func _external_material(mat: Material, out_dir: String, saved: Dictionary) -> Material:
 	if mat == null:
 		return null
@@ -520,9 +566,12 @@ static func _external_material(mat: Material, out_dir: String, saved: Dictionary
 		return saved[mat]
 	var result := mat
 	if mat.resource_path.is_empty() or mat.resource_path.contains("::"):
-		result = mat.duplicate()
 		var mname := mat.resource_name if not mat.resource_name.is_empty() else "material_%d" % saved.size()
 		var path := out_dir.path_join("materials/%s.tres" % mname.validate_filename())
+		if ResourceLoader.exists(path):
+			saved[mat] = load(path)
+			return saved[mat]
+		result = mat.duplicate()
 		ResourceSaver.save(result, path)
 		result.take_over_path(path)
 		_register_file(path)
